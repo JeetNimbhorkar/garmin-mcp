@@ -3,10 +3,13 @@ import {
   metadataCorsOptionsRequestHandler,
 } from "mcp-handler";
 
-export const GET = (req: Request) => {
-  const issuer =
-    process.env.AUTH0_ISSUER?.replace(/\/$/, "");
+const RESOURCE_URL =
+  "https://garmin-mcp-nu.vercel.app/api/mcp";
 
+const issuer =
+  process.env.AUTH0_ISSUER?.replace(/\/$/, "");
+
+export const GET = (req: Request) => {
   if (!issuer) {
     return Response.json(
       { error: "OAuth not configured" },
@@ -15,7 +18,8 @@ export const GET = (req: Request) => {
   }
 
   return protectedResourceHandler({
-    authServerUrls: [`${issuer}/`],
+    authServerUrls: [issuer + "/"],
+    resourceUrl: RESOURCE_URL,
   })(req);
 };
 
