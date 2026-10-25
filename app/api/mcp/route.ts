@@ -10,6 +10,8 @@ import {
   endpointCatalog,
 } from "../../../lib/garmin/endpoints";
 
+import { dailySeries, activityDigest, recoveryDigest } from "../../../lib/garmin/analysis";
+
 // This file is app/api/mcp/route.ts. The imports above point to
 // PROJECT_ROOT/lib/garmin/*.ts (three parent directories up).
 
@@ -224,6 +226,85 @@ const handler = createMcpHandler((server) => {
       } catch (error) {
         return errorResult(error);
       }
+    }
+  );
+
+  // Higher-level read-only analytics modeled on useful ideas from Garmin MCP projects.
+  // These tools use ONLY the previously verified Garmin Personal API read endpoints.
+  server.registerTool(
+    "garmin_analyze_daily_trends",
+    {
+      description: "Calculate day-by-day trends from Garmin's official read-only summaries. Supports resting heart rate, steps, stress, and HRV. Requires a limited interval; reports missing values honestly.",
+      inputSchema: z.object({
+        metric: z.enum(["resting_hr", "steps", "stress", "hrv"]),
+        start_date: dateSchema,
+        end_date: dateSchema,
+      }),
+    },
+    async ({ metric, start_date, end_date }) => {
+      try {
+        validateRange(start_date, end_date);
+        const days = Math.round((Date.parse(end_date)-Date.parse(start_date))/86400000)+1;
+        if (days > 90) throw new Error("Trend requests are limited to 90 calendar days; divide longer periods into intervals.");
+        const specs = {
+          resting_hr: { path: "/usersummary-service/v2/dailysummaries", query: { startDate:start_date, endDate:end_date }, fields: ["restingHeartRate", "restingHeartRateValue"] },
+          steps: { path: `/usersummary-service/stats/steps/daily/${start_date}/${end_date}`, query: {}, fields: ["totalSteps", "steps", "stepCount"] },
+          stress: { path: `/usersummary-service/stats/stress/daily/${start_date}/${end_date}`, query: {}, fields: ["averageStressLevel", "avgStressLevel", "stressLevel"] },
+          hrv: { path: `/hrv-service/hrv/daily/${start_date}/${end_date}`, query: {}, fields: ["lastNightAvg", "weeklyAvg", "avgOvernightHrv"] },
+        } as const;
+        const spec = specs[metric];
+        const raw = await garminGetJson(spec.path, spec.query);
+        return textResult({ metric, start_date, end_date, stats: dailySeries(raw, [...spec.fields]), source_endpoint: spec.path, note: "Only recognized numeric fields are aggregated; check numeric_observations before interpreting results." });
+      } catch (error) { return errorResult(error); }
+    }
+  );
+
+  server.registerTool(
+    "garmin_recovery_snapshot",
+    {
+      description: "Combine official Garmin sleep, HRV, heart rate and Body Battery results for one date. Factual snapshot, NOT an invented readiness score.",
+      inputSchema: z.object({ date: dateSchema }),
+    },
+    async ({ date }) => {
+      try {
+        validateDate(date);
+        const requests = [
+          () => garminGetJson("/sleep-service/sleep/dailySleep", { date }),
+          () => garminGetJson(`/hrv-service/hrv/${date}`),
+          () => garminGetJson("/wellness-service/wellness/dailyHeartRate", { date }),
+          () => garminGetJson("/wellness-service/wellness/bodyBattery/reports/daily", { startDate:date, endDate:date }),
+        ];
+        const resolved = await Promise.all(requests.map(fn=>fn().then(value=>({ok:true,value})).catch(error=>({ok:false,error:error instanceof Error?error.message:String(error)}))));
+        const [sleep,hrv,heartRate,battery]=resolved.map(r=>r.ok && "value" in r ? r.value : null);
+        return textResult({ ...recoveryDigest(date,sleep,hrv,heartRate,battery) as object,
+          sources: ["sleep","hrv","heart_rate","body_battery"].map((name,i)=>({name,ok:resolved[i].ok,...(!resolved[i].ok && "error" in resolved[i] ? {error:resolved[i].error}: {})}))
+        });
+      } catch (error) { return errorResult(error); }
+    }
+  );
+
+  server.registerTool(
+    "garmin_analyze_activities",
+    {
+      description: "Summarize Garmin's activity-search results: distance, duration, pace, HR and aerobic training effect where available. Supports pagination; does not pretend an incomplete page is a complete training history.",
+      inputSchema: z.object({
+        start_date: dateSchema.optional(),
+        end_date: dateSchema.optional(),
+        activity_type: z.string().max(80).optional(),
+        start: z.number().int().min(0).default(0),
+        limit: z.number().int().min(1).max(30).default(20),
+      }),
+    },
+    async ({start_date,end_date,activity_type,start,limit}) => {
+      try {
+        if (start_date) validateDate(start_date);
+        if (end_date) validateDate(end_date);
+        if (start_date && end_date) validateRange(start_date,end_date);
+        const raw=await garminGetJson("/activitylist-service/activities/search/activities",{
+          start,limit,startDate:start_date,endDate:end_date,activityType:activity_type
+        });
+        return textResult({filters:{start_date,end_date,activity_type,start,limit},analysis:activityDigest(raw,limit)});
+      } catch (error) { return errorResult(error); }
     }
   );
 
