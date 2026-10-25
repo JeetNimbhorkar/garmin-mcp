@@ -126,23 +126,60 @@ export function activityDigest(raw: unknown, limit: number): unknown {
 function stageDuration(sleep: JsonRecord, detail: JsonRecord, aliases: string[]): number | null {
   return numberAt(detail,aliases) ?? numberAt(sleep,aliases);
 }
+/**
+ * Garmin Body Battery reports use descriptor-indexed samples:
+ * bodyBatteryValueDescriptorDTOList maps array positions to fields, and
+ * bodyBatteryValuesArray contains timestamped tuples in that field order.
+ * The returned values describe samples, NOT necessarily midnight/end-of-day.
+ */
 function batterySummary(raw: unknown): unknown {
   const item = arr(raw)[0] ?? raw;
   const detail = obj(item) ?? {};
-  const vals = pick(detail,['bodyBatteryValues','bodyBatteryValueArray','batteryValues']);
-  const points = Array.isArray(vals) ? vals : [];
-  // Avoid dumping large high-frequency sample arrays; summary only.
-  const readings = points.map(p => Array.isArray(p) ? p[1] : numberAt(p,['bodyBattery','value','batteryLevel']))
-    .filter((v):v is number => typeof v === 'number' && Number.isFinite(v));
+  const descriptors = pick(detail, [
+    'bodyBatteryValueDescriptorDTOList',
+    'bodyBatteryValueDescriptors',
+  ]);
+  const descriptorList = Array.isArray(descriptors) ? descriptors : [];
+  const descriptorName = (descriptor: unknown): string | null => {
+    if (typeof descriptor === 'string') return descriptor;
+    const name = pick(descriptor, [
+      'key', 'name', 'fieldName', 'field', 'type', 'descriptor', 'valueKey',
+    ]);
+    return typeof name === 'string' ? name : null;
+  };
+  const levelIndex = descriptorList.findIndex(
+    d => descriptorName(d)?.toLowerCase() === 'bodybatterylevel'
+  );
+  // Older response variants sometimes omit descriptors but put the level
+  // in tuple position 1. That fallback is not used when descriptors exist
+  // but do not identify the level column (avoids silently wrong data).
+  const sampleArrays = pick(detail, [
+    'bodyBatteryValuesArray',
+    'bodyBatteryValues',
+    'bodyBatteryValueArray',
+    'batteryValues',
+  ]);
+  const points = Array.isArray(sampleArrays) ? sampleArrays : [];
+  const readings: number[] = [];
+  for (const point of points) {
+    let value: unknown = null;
+    if (Array.isArray(point)) {
+      const index = levelIndex >= 0 ? levelIndex : descriptorList.length === 0 ? 1 : -1;
+      if (index >= 0) value = point[index];
+    } else {
+      value = numberAt(point, ['bodyBatteryLevel', 'bodyBattery', 'batteryLevel', 'value']);
+    }
+    if (typeof value === 'number' && Number.isFinite(value)) readings.push(value);
+  }
   return {
-    start: numberAt(detail,['startValue','startBodyBattery','start']),
-    end: numberAt(detail,['endValue','endBodyBattery','end']),
-    charged: numberAt(detail,['charged','chargedValue','chargedAmount']),
-    drained: numberAt(detail,['drained','drainedValue','drainedAmount']),
-    high: numberAt(detail,['highestValue','high','maxValue']) ?? (readings.length ? Math.max(...readings) : null),
-    low: numberAt(detail,['lowestValue','low','minValue']) ?? (readings.length ? Math.min(...readings) : null),
+    first_sample: readings.length ? readings[0] : null,
+    last_sample: readings.length ? readings[readings.length - 1] : null,
+    charged: numberAt(detail, ['charged','chargedValue','chargedAmount']),
+    drained: numberAt(detail, ['drained','drainedValue','drainedAmount']),
+    high: readings.length ? Math.max(...readings) : numberAt(detail, ['highestValue','high','maxValue']),
+    low: readings.length ? Math.min(...readings) : numberAt(detail, ['lowestValue','low','minValue']),
     sampled_points: readings.length,
-    note: 'Only fields recognized from the API response are shown. No readiness score inferred.'
+    note: 'First/last represent the first/last valid samples returned by Garmin, not necessarily start/end-of-day. Missing samples are not interpolated.'
   };
 }
 export function recoveryDigest(date: string, sleep: unknown, hrv: unknown, heartRate: unknown, battery: unknown): unknown {
