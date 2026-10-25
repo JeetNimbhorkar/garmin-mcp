@@ -38,7 +38,7 @@ async function garminFetch(
 
 // Exchange Garmin's API key for an access token.
 async function getGarminAccessToken(): Promise<string> {
-  const apiKey = process.env.GARMIN_PERSONAL_API_KEY;
+  const apiKey = process.env.GARMIN_PERSONAL_API_KEY?.trim();
 
   if (!apiKey) {
     throw new Error(
@@ -59,7 +59,7 @@ async function getGarminAccessToken(): Promise<string> {
       method: "POST",
       headers: {
         Authorization: `ApiKey ${apiKey}`,
-        Accept: "application/json",
+        Accept: "*/*",
       },
     }
   );
@@ -70,45 +70,44 @@ async function getGarminAccessToken(): Promise<string> {
     );
   }
 
-  const data: unknown = await response.json();
+  // Garmin returns a raw JWT string, NOT JSON.
+  const accessToken = (await response.text()).trim();
 
-  if (
-    !data ||
-    typeof data !== "object" ||
-    !("access_token" in data) ||
-    typeof data.access_token !== "string" ||
-    !data.access_token
-  ) {
+  const parts = accessToken.split(".");
+
+  if (parts.length !== 3) {
     throw new Error(
-      "Garmin token response did not include an access_token."
+      "Garmin returned an unexpected token format."
     );
   }
 
-  // Garmin access tokens are JWTs. Read expiry for
-  // caching, without treating the decoded data as
-  // an authorization decision.
-  let expiresAt = Date.now() + 5 * 60 * 1000;
+  let expiresAt: number;
 
   try {
-    const parts = data.access_token.split(".");
     const payload = JSON.parse(
       Buffer.from(parts[1], "base64url").toString("utf8")
     ) as { exp?: unknown };
 
-    if (typeof payload.exp === "number") {
-      expiresAt = payload.exp * 1000;
+    if (
+      typeof payload.exp !== "number" ||
+      !Number.isFinite(payload.exp)
+    ) {
+      throw new Error("Missing token expiration");
     }
+
+    expiresAt = payload.exp * 1000;
   } catch {
-    // Keep short-lived fallback cache if the token
-    // expiry cannot be decoded.
+    throw new Error(
+      "Garmin returned a token without a valid expiration."
+    );
   }
 
   cachedGarminToken = {
-    access_token: data.access_token,
+    access_token: accessToken,
     expires_at: expiresAt,
   };
 
-  return data.access_token;
+  return accessToken;
 }
 
 // Fetch a read-only Garmin Personal API resource.
