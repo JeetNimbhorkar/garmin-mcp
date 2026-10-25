@@ -10,7 +10,7 @@ import {
   endpointCatalog,
 } from "../../../lib/garmin/endpoints";
 
-import { dailySeries, activityDigest, recoveryDigest } from "../../../lib/garmin/analysis";
+import { dailySeries, summarizeDailyRows, activityDigest, recoveryDigest, numberAt } from "../../../lib/garmin/analysis";
 
 // This file is app/api/mcp/route.ts. The imports above point to
 // PROJECT_ROOT/lib/garmin/*.ts (three parent directories up).
@@ -246,11 +246,41 @@ const handler = createMcpHandler((server) => {
         validateRange(start_date, end_date);
         const days = Math.round((Date.parse(end_date)-Date.parse(start_date))/86400000)+1;
         if (days > 90) throw new Error("Trend requests are limited to 90 calendar days; divide longer periods into intervals.");
+        if (metric === "resting_hr") {
+          // Garmin's detailed dailyHeartRate returns restingHeartRate directly.
+          // The generic dailysummaries response may not contain that field.
+          // Bound fanout for Vercel execution time and Garmin rate limits.
+          if (days > 31) throw new Error("Resting-HR trends are limited to 31 days per call because each day requires its own heart-rate request. Split longer periods into monthly calls.");
+          const dates = Array.from({length:days}, (_,i) => new Date(Date.parse(start_date)+i*86400000).toISOString().slice(0,10));
+          const rows: Array<{date:string;value:number|null}> = [];
+          const errors: Array<{date:string;error:string}> = [];
+          for (let i=0; i<dates.length; i+=5) {
+            const batch = dates.slice(i,i+5);
+            const results = await Promise.all(batch.map(async date => {
+              try {
+                const raw = await garminGetJson("/wellness-service/wellness/dailyHeartRate",{date});
+                return {date,value:numberAt(raw,["restingHeartRate","restingHeartRateValue"]),error:null};
+              } catch (e) {
+                return {date,value:null,error:e instanceof Error?e.message:String(e)};
+              }
+            }));
+            for (const result of results) {
+              rows.push({date:result.date,value:result.value});
+              if (result.error) errors.push({date:result.date,error:result.error});
+            }
+          }
+          return textResult({
+            metric,start_date,end_date,
+            stats:summarizeDailyRows(rows,["restingHeartRate","restingHeartRateValue"]),
+            source_endpoint:"/wellness-service/wellness/dailyHeartRate?date=YYYY-MM-DD",
+            failed_requests:errors,
+            note:"One documented daily heart-rate request per calendar day. No imputation; errors and missing values are separate."
+          });
+        }
         const specs = {
-          resting_hr: { path: "/usersummary-service/v2/dailysummaries", query: { startDate:start_date, endDate:end_date }, fields: ["restingHeartRate", "restingHeartRateValue"] },
           steps: { path: `/usersummary-service/stats/steps/daily/${start_date}/${end_date}`, query: {}, fields: ["totalSteps", "steps", "stepCount"] },
           stress: { path: `/usersummary-service/stats/stress/daily/${start_date}/${end_date}`, query: {}, fields: ["averageStressLevel", "avgStressLevel", "stressLevel"] },
-          hrv: { path: `/hrv-service/hrv/daily/${start_date}/${end_date}`, query: {}, fields: ["lastNightAvg", "weeklyAvg", "avgOvernightHrv"] },
+          hrv: { path: `/hrv-service/hrv/daily/${start_date}/${end_date}`, query: {}, fields: ["lastNightAvg", "avgOvernightHrv"] },
         } as const;
         const spec = specs[metric];
         const raw = await garminGetJson(spec.path, spec.query);
@@ -286,7 +316,7 @@ const handler = createMcpHandler((server) => {
   server.registerTool(
     "garmin_analyze_activities",
     {
-      description: "Summarize Garmin's activity-search results: distance, duration, pace, HR and aerobic training effect where available. Supports pagination; does not pretend an incomplete page is a complete training history.",
+      description: "Summarize Garmin activities with separate recorded/timer duration, moving duration and elapsed duration; sport-appropriate pace or speed, HR and training effect. Supports pagination; does not pretend an incomplete page is a complete training history.",
       inputSchema: z.object({
         start_date: dateSchema.optional(),
         end_date: dateSchema.optional(),
