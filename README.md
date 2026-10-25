@@ -10,7 +10,7 @@ A personal Garmin Connect MCP server for **ChatGPT**, hosted on **Vercel** and p
 - Garmin API-key → bearer-token exchange and `garmin_get_profile`: verified with real data.
 - 24 dedicated official Python-client-equivalent data operations: registered; several categories tested successfully. **Not every operation individually verified**.
 - `garmin_get_raw_endpoint` allows additional *known, documented* Garmin Personal API GET routes that have no dedicated wrapper. This is **not automatic endpoint discovery**.
-- Server-side analytics: **new in this release**; deploy and test against real responses before treating results as reliable.
+- Server-side analytics: **corrected in Phase 5.1** for daily resting-HR extraction, separate duration semantics, and compact recovery details. Live validation is still required after deployment.
 - **Complete Swagger parity is not claimed.** See [Coverage limitations](#coverage-limitations).
 
 ## Architecture
@@ -102,7 +102,7 @@ The 24 operations mirror the publicly documented wrapper list at <https://github
 
 | Tool | What it does | Important limitation |
 |---|---|---|
-| `garmin_analyze_daily_trends` | Daily average/min/max/sum and early-versus-late comparisons for `resting_hr`, `steps`, `stress`, `hrv` up to 90 days | Aggregates only recognized source fields and clearly reports observation counts; **HRV trend is not a medical assessment** |
+| `garmin_analyze_daily_trends` | Daily averages and trends for `resting_hr` (up to 31 days from individual daily-heart-rate records); `steps`, `stress`, `hrv` up to 90 days | Aggregates only recognized source fields and clearly reports observation counts; **HRV trend is not a medical assessment** |
 | `garmin_recovery_snapshot` | Collects sleep, HRV, heart rate and Body Battery for one date with per-source success/failure | Factual composite, **not** a proprietary Garmin Training Readiness score or scientifically validated substitute |
 | `garmin_analyze_activities` | Summarizes up to 30 activities/page: distance, duration, calculated pace, HR, elevation and training effect where present | Depends on field names; page totals are not assumed to be complete history |
 
@@ -158,3 +158,11 @@ If the final deployment fails, inspect Vercel build logs and share the exact **n
 ## Privacy and safety
 
 Read-only data access still reveals health and activity information to the authenticated ChatGPT client when invoked. Use plugin permissions appropriate to your comfort and never expose the Vercel URL with unsecured routes. A Garmin API token is cached **only in serverless process memory**, never committed to GitHub or returned by MCP tools. Serverless memory is ephemeral and token exchange occurs again when needed. This project offers descriptive trends only; it is not a diagnostic or medical device.
+
+## Phase 5.1 accuracy fixes (2026-10-25)
+
+- **Resting HR trends** now use Garmin's documented `/wellness-service/wellness/dailyHeartRate?date=...` endpoint. Each date is fetched separately, five requests concurrently at most, with a 31-day limit per call. Null readings and failed requests are explicitly reported. Larger retrospective comparisons should be divided into monthly intervals. This fixes the mismatch where 20 daily-summary records yielded zero recognized resting-HR values.
+- **Activity duration** is now three separate values: `duration_minutes` (Garmin `duration`/`timerDuration`), `moving_duration_minutes`, and `elapsed_duration_minutes`. `total_duration_minutes` sums **only** the `duration` values. Missing duration is null, not substituted by moving time. Totals for each type report coverage counts and should not be conflated. Running/walking/hiking pace is calculated from Garmin duration; cycling/suitable sports receive speed in km/h; swimming and strength receive neither synthetic running pace nor irrelevant speed. Garmin fields vary across sports and firmware; check against raw activities.
+- **Recovery snapshot** recognizes a nested `sleepScores.overall.value` and common stage-duration fields when returned, and replaces full raw Body Battery timeseries with a compact statistical summary. Fields that are not present remain null; no score is invented.
+
+> A passing local calculation test is not the same as validating production Garmin records. Run the Phase 5.1 test checklist after deployment. The documented 24 wrapper operations and Auth0 protection have not changed.
