@@ -65,7 +65,9 @@ async function verifyToken(
     return {
       token: bearerToken,
       scopes,
-      clientId: payload.azp ?? payload.sub ?? "unknown",
+      clientId: typeof payload.azp === "string"
+        ? payload.azp
+        : (payload.sub ?? "unknown"),
     };
   } catch {
     return undefined;
