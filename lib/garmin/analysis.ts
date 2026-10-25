@@ -127,59 +127,112 @@ function stageDuration(sleep: JsonRecord, detail: JsonRecord, aliases: string[])
   return numberAt(detail,aliases) ?? numberAt(sleep,aliases);
 }
 /**
- * Garmin Body Battery reports use descriptor-indexed samples:
- * bodyBatteryValueDescriptorDTOList maps array positions to fields, and
- * bodyBatteryValuesArray contains timestamped tuples in that field order.
- * The returned values describe samples, NOT necessarily midnight/end-of-day.
+ * Garmin Body Battery reports may be an object, an array of daily reports,
+ * or a nested response. Descriptor fields may vary by API version.
+ * We only infer the level column without a descriptor for *two-element*
+ * [timestamp, level] tuples, and label that inference in the output.
  */
 function batterySummary(raw: unknown): unknown {
-  const item = arr(raw)[0] ?? raw;
-  const detail = obj(item) ?? {};
-  const descriptors = pick(detail, [
-    'bodyBatteryValueDescriptorDTOList',
-    'bodyBatteryValueDescriptors',
-  ]);
-  const descriptorList = Array.isArray(descriptors) ? descriptors : [];
-  const descriptorName = (descriptor: unknown): string | null => {
-    if (typeof descriptor === 'string') return descriptor;
-    const name = pick(descriptor, [
-      'key', 'name', 'fieldName', 'field', 'type', 'descriptor', 'valueKey',
-    ]);
+  type Candidate = { report: JsonRecord; points: unknown[]; path: string; levelIndex: number; method: string };
+  const candidates: Candidate[] = [];
+  const inspected = new WeakSet<object>();
+  const aliases = ['bodyBatteryValuesArray', 'bodyBatteryValues', 'bodyBatteryValueArray', 'batteryValues'];
+  const descriptorAliases = ['bodyBatteryValueDescriptorDTOList', 'bodyBatteryValueDescriptors'];
+
+  function columnName(entry: unknown): string | null {
+    if (typeof entry === 'string') return entry;
+    const r = obj(entry);
+    if (!r) return null;
+    const name = pick(r, ['key', 'name', 'fieldName', 'field', 'type', 'descriptor', 'valueKey', 'description', 'valueName']);
     return typeof name === 'string' ? name : null;
-  };
-  const levelIndex = descriptorList.findIndex(
-    d => descriptorName(d)?.toLowerCase() === 'bodybatterylevel'
-  );
-  // Older response variants sometimes omit descriptors but put the level
-  // in tuple position 1. That fallback is not used when descriptors exist
-  // but do not identify the level column (avoids silently wrong data).
-  const sampleArrays = pick(detail, [
-    'bodyBatteryValuesArray',
-    'bodyBatteryValues',
-    'bodyBatteryValueArray',
-    'batteryValues',
-  ]);
-  const points = Array.isArray(sampleArrays) ? sampleArrays : [];
-  const readings: number[] = [];
-  for (const point of points) {
-    let value: unknown = null;
-    if (Array.isArray(point)) {
-      const index = levelIndex >= 0 ? levelIndex : descriptorList.length === 0 ? 1 : -1;
-      if (index >= 0) value = point[index];
-    } else {
-      value = numberAt(point, ['bodyBatteryLevel', 'bodyBattery', 'batteryLevel', 'value']);
-    }
-    if (typeof value === 'number' && Number.isFinite(value)) readings.push(value);
   }
+
+  function levelColumn(report: JsonRecord, points: unknown[]): { index: number; method: string } {
+    const rawDescriptors = pick(report, descriptorAliases);
+    const descriptors = Array.isArray(rawDescriptors) ? rawDescriptors : [];
+    const index = descriptors.findIndex(d => {
+      const name = columnName(d);
+      return !!name && /body.?battery.?level/i.test(name.replace(/[_\s-]+/g, ''));
+    });
+    if (index >= 0) {
+      const descriptor = obj(descriptors[index]);
+      const explicitIndex = descriptor ? numberAt(descriptor, ['index', 'arrayIndex', 'columnIndex']) : null;
+      return { index: explicitIndex !== null && Number.isInteger(explicitIndex) && explicitIndex >= 0 ? explicitIndex : index, method: 'descriptor' };
+    }
+    // Safe structural fallback only if ALL tuple samples are exactly
+    // [timestamp, level] pairs. This prevents selecting a random field
+    // from a wider descriptor-indexed response.
+    const tuples = points.filter(Array.isArray);
+    if (tuples.length > 0 && tuples.every(p => p.length === 2)) {
+      return { index: 1, method: 'two_column_tuple_fallback' };
+    }
+    return { index: -1, method: 'unrecognized_columns' };
+  }
+
+  function walk(value: unknown, path: string, depth: number, parent: JsonRecord | null): void {
+    if (depth > 7 || value === null || typeof value !== 'object' || inspected.has(value)) return;
+    inspected.add(value);
+    if (Array.isArray(value)) {
+      for (let n = 0; n < Math.min(value.length, 100); n++) {
+        // The sample arrays themselves are handled by the parent.
+        if (obj(value[n]) || (Array.isArray(value[n]) && !Array.isArray(value[n][0]))) {
+          walk(value[n], `${path}[${n}]`, depth + 1, parent);
+        }
+      }
+      return;
+    }
+    const record = obj(value);
+    if (!record) return;
+    for (const alias of aliases) {
+      const points = record[alias];
+      if (Array.isArray(points) && points.length) {
+        const descriptors = pick(record, descriptorAliases) ?? (parent ? pick(parent, descriptorAliases) : null);
+        const enriched = descriptors ? { ...record, bodyBatteryValueDescriptorDTOList: descriptors } : record;
+        const col = levelColumn(enriched, points);
+        candidates.push({ report: record, points, path: `${path}.${alias}`, levelIndex: col.index, method: col.method });
+      }
+    }
+    for (const [key, child] of Object.entries(record)) {
+      if (aliases.includes(key)) continue;
+      if (child && typeof child === 'object') walk(child, `${path}.${key}`, depth + 1, record);
+    }
+  }
+  walk(raw, '$', 0, null);
+
+  function readingsFor(candidate: Candidate): number[] {
+    const result: number[] = [];
+    for (const point of candidate.points) {
+      const value = Array.isArray(point)
+        ? candidate.levelIndex >= 0 ? point[candidate.levelIndex] : null
+        : numberAt(point, ['bodyBatteryLevel', 'bodyBattery', 'batteryLevel', 'value']);
+      if (typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 100) result.push(value);
+    }
+    return result;
+  }
+  // Prefer the candidate with the most valid samples; retain actual sample order.
+  const ranked = candidates.map(c => ({ ...c, readings: readingsFor(c) }))
+    .sort((a, b) => b.readings.length - a.readings.length);
+  const selected = ranked[0];
+  const readings = selected?.readings ?? [];
+  // Charge/drain metadata can be outside the nested sample container.
+  const root = obj(raw) ?? (Array.isArray(raw) ? obj(raw[0]) : null) ?? {};
+  const detail = selected?.report ?? root;
+  const metadata = (names: string[]) => numberAt(detail, names) ?? numberAt(root, names);
+
   return {
     first_sample: readings.length ? readings[0] : null,
     last_sample: readings.length ? readings[readings.length - 1] : null,
-    charged: numberAt(detail, ['charged','chargedValue','chargedAmount']),
-    drained: numberAt(detail, ['drained','drainedValue','drainedAmount']),
-    high: readings.length ? Math.max(...readings) : numberAt(detail, ['highestValue','high','maxValue']),
-    low: readings.length ? Math.min(...readings) : numberAt(detail, ['lowestValue','low','minValue']),
+    charged: metadata(['charged', 'chargedValue', 'chargedAmount']),
+    drained: metadata(['drained', 'drainedValue', 'drainedAmount']),
+    high: readings.length ? Math.max(...readings) : metadata(['highestValue', 'high', 'maxValue']),
+    low: readings.length ? Math.min(...readings) : metadata(['lowestValue', 'low', 'minValue']),
     sampled_points: readings.length,
-    note: 'First/last represent the first/last valid samples returned by Garmin, not necessarily start/end-of-day. Missing samples are not interpolated.'
+    sample_parse: {
+      source_path: selected?.path ?? null,
+      method: selected?.method ?? 'no_sample_array_found',
+      candidate_arrays: candidates.length,
+    },
+    note: 'First/last refer to valid returned samples, not necessarily midnight/end-of-day; missing samples are never interpolated.'
   };
 }
 export function recoveryDigest(date: string, sleep: unknown, hrv: unknown, heartRate: unknown, battery: unknown): unknown {
